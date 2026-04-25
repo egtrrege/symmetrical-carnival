@@ -1,113 +1,93 @@
-#!/bin/bash
+$isoPath = "C:\temp\Win10_1909.iso"
+$isoDirectory = Split-Path $isoPath
+$minimumSpace = 15
+$availableSpace = (Get-Volume C).SizeRemaining / 1GB
+$ProgressPreference = 'SilentlyContinue'
 
-set +e
-
-VM="win10"
-DISK="/var/lib/libvirt/images/win10.qcow2"
-ISO="win10.iso"
-RAM=16384
-CPU=6
-VNC_PORT=5900
-WEB_PORT=6080
-
-echo "==== WINDOWS 10 AUTO INSTALL (FIXED VERSION) ===="
-
-install() {
-
-echo "[1] Installing dependencies..."
-apt update -y
-apt install -y qemu-kvm libvirt-daemon-system virtinst novnc websockify curl wget ovmf aria2
-
-systemctl enable --now libvirtd
-
-echo "[2] Cleaning old VM..."
-virsh destroy $VM 2>/dev/null
-virsh undefine $VM 2>/dev/null
-rm -f $DISK $ISO
-
-echo "[3] Creating disk..."
-qemu-img create -f qcow2 $DISK 80G
-
-echo "[4] Download ISO (multi-source fallback)..."
-
-URLS=(
-"https://archive.org/download/windows-10-22h2-english-x64/Win10_22H2_English_x64.iso"
-"https://software-download.microsoft.com/db/Win10_22H2_English_x64.iso"
-)
-
-for url in "${URLS[@]}"; do
-echo "[TRY] $url"
-wget --user-agent="Mozilla/5.0" -O $ISO "$url"
-
-if [ -f "$ISO" ] && [ $(stat -c%s "$ISO") -gt 1000000000 ]; then
-echo "[OK] ISO downloaded"
-break
-else
-echo "[FAIL] next source..."
-rm -f $ISO
-fi
-done
-
-if [ ! -f "$ISO" ]; then
-echo "[ERROR] ISO download failed"
-exit 1
-fi
-
-echo "[5] Creating VM..."
-virt-install \
---name $VM \
---ram $RAM \
---vcpus $CPU \
---disk path=$DISK,bus=virtio \
---os-variant win10 \
---boot uefi \
---cdrom $ISO \
---network network=default,model=virtio \
---graphics vnc,listen=0.0.0.0,port=$VNC_PORT \
---noautoconsole
-
-echo "[6] Starting noVNC..."
-websockify --web=/usr/share/novnc/ $WEB_PORT localhost:$VNC_PORT > novnc.log 2>&1 &
-
-sleep 3
-
-echo "[7] Cloudflare Tunnel starting..."
-curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-chmod +x cloudflared
-
-./cloudflared tunnel --no-autoupdate --url http://localhost:$WEB_PORT > tunnel.log 2>&1 &
-
-sleep 5
-
-echo "====================================="
-echo "DONE"
-echo "Check tunnel.log for your URL"
-echo "====================================="
+if (-not (Test-Path $isoDirectory)) {
+    New-Item -Path $isoDirectory -ItemType directory -Force
 }
 
-uninstall() {
-echo "[!] Cleaning system..."
-
-virsh destroy $VM 2>/dev/null
-virsh undefine $VM 2>/dev/null
-
-rm -f $DISK $ISO
-
-pkill websockify 2>/dev/null
-pkill cloudflared 2>/dev/null
-
-apt purge -y qemu-kvm libvirt-daemon-system virtinst novnc websockify ovmf
-apt autoremove -y
-
-echo "[OK] Fully removed"
+if (Test-Path $isoPath) {
+    Remove-Item -Path $isoPath -Force
 }
 
-echo "1) Install Windows 10"
-echo "2) Uninstall"
-read -p "Choice: " c
+if (-not (Test-Path $isoPath) -and $availableSpace -gt $minimumSpace) { #win10 base download code modified from FIDO: https://raw.githubusercontent.com/pbatard/Fido/master/Fido.ps1
 
-if [ "$c" == "1" ]; then
-install
-else
-uninstall
-fi
+    #base variables
+    $SessionId = [guid]::NewGuid()
+    $RequestData = @{}
+    $RequestData["GetLangs"] = @("a8f8f489-4c7f-463a-9ca6-5cff94d8d041", "getskuinformationbyproductedition" )
+    $RequestData["GetLinks"] = @("cfa9e580-a81e-4a4b-a846-7b21bf4e2e5b", "GetProductDownloadLinksBySku" )
+
+    $FirefoxVersion = Get-Random -Minimum 47 -Maximum 60
+    [DateTime]$Min = "1/1/2012"
+    [DateTime]$Max = [DateTime]::Now
+    $RandomGen = new-object random
+    $RandomTicks = [Convert]::ToInt64( ($Max.ticks * 1.0 - $Min.Ticks * 1.0 ) * $RandomGen.NextDouble() + $Min.Ticks * 1.0 )
+    $Date = new-object DateTime($RandomTicks)
+    $FirefoxDate = $Date.ToString("yyyyMMdd")
+    $UserAgent = "Mozilla/5.0 (X11; Linux i586; rv:$FirefoxVersion.0) Gecko/$FirefoxDate Firefox/$FirefoxVersion.0"
+
+    $url = "https://www.microsoft.com/en-US/api/controls/contentinclude/html"
+    $url += "?pageId=" + $RequestData["GetLangs"][0]
+    $url += "&host=www.microsoft.com"
+    $url += "&segments=software-download,Windows10ISO"
+    $url += "&query=&action=" + $RequestData["GetLangs"][1]
+    $url += "&sessionId=" + $SessionId
+    $url += "&productEditionId=1214"
+    $url += "&sdVersion=2"
+    $r = Invoke-WebRequest -UserAgent $UserAgent -WebSession $Session $url
+
+    $url = "https://www.microsoft.com/en-US/api/controls/contentinclude/html"
+    $url += "?pageId=" + $RequestData["GetLinks"][0]
+    $url += "&host=www.microsoft.com"
+    $url += "&segments=software-download,Windows10ISO"
+    $url += "&query=&action=" + $RequestData["GetLinks"][1]
+    $url += "&sessionId=" + $SessionId
+    $url += "&skuId=8143" #english x64 sku id
+    $url += "&language=English"
+    $url += "&sdVersion=2"
+    $r = Invoke-WebRequest -UserAgent $UserAgent -WebSession $Session $url
+
+    $i = 0
+    $SelectedIndex = 0
+    $array = @()
+    try {
+        $Is64 = [Environment]::Is64BitOperatingSystem
+        $r = Invoke-WebRequest -UserAgent $UserAgent -WebSession $Session $url
+        if (-not $($r.AllElements | ? {$_.id -eq "expiration-time"})) {
+            Throw-Error -Req $r -Alt Get-Translation($English[14])
+        }
+        $html = $($r.AllElements | ? {$_.tagname -eq "input"}).outerHTML
+        # Need to fix the HTML and JSON data so that it is well-formed
+        $html = $html.Replace("class=product-download-hidden", "")
+        $html = $html.Replace("type=hidden", "")
+        $html = $html.Replace(">", "/>")
+        $html = $html.Replace("IsoX86", """x86""")
+        $html = $html.Replace("IsoX64", """x64""")
+        $html = "<inputs>" + $html + "</inputs>"
+        $xml = [xml]$html
+        foreach ($var in $xml.inputs.input) {
+            $json = $var.value | ConvertFrom-Json;
+            if ($json) {
+                $SelectedIndex = $i
+                $array += @(New-Object PsObject -Property @{ Type = $json.DownloadType; Link = $json.Uri })
+                $i++
+            }
+        }
+        if ($array.Length -eq 0) {
+            Throw-Error -Req $r -Alt "Could not retrieve ISO download links"
+        }
+    } catch {
+        Write-Output $_.Exception.Message
+        return
+    }
+
+    $isoLink = $array | Where-Object {$_.Type -eq 'x64'} | Select -ExpandProperty Link #extract only the x64 download link
+
+    Write-Output "Downloading ISO from $isoLink"
+    Invoke-WebRequest -UserAgent $UserAgent -WebSession $Session -Uri $isoLink -OutFile $isoPath #initiate the download
+
+
+}
